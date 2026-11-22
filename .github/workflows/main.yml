@@ -1,0 +1,166 @@
+name: RDP
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install Node, Python, Git
+        shell: pwsh
+        run: |
+          choco install nodejs-lts python git 7zip -y --no-progress
+          $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+          node --version
+          npm --version
+          python --version
+          git --version
+      - name: Install OpenCode
+        shell: pwsh
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+          npm install -g opencode-ai@latest
+          $npmBin = (npm config get prefix).Trim()
+          $machinePath = [Environment]::GetEnvironmentVariable("Path","Machine")
+          if ($machinePath -notlike "*$npmBin*") {
+            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$npmBin", "Machine")
+          }
+          $env:Path += ";$npmBin"
+          opencode --version
+      - name: Install Mesa3D (safe mode)
+        shell: pwsh
+        run: |
+          $ver = "24.3.4"
+          $url = "https://github.com/pal1000/mesa-dist-win/releases/download/$ver/mesa3d-$ver-release-msvc.7z"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\mesa3d.7z" -UseBasicParsing
+          $mesaDir = "C:\mesa3d"
+          New-Item -ItemType Directory -Force -Path $mesaDir | Out-Null
+          & "C:\Program Files\7-Zip\7z.exe" x "$env:TEMP\mesa3d.7z" -o"$mesaDir" -y | Out-Null
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "$env:TEMP\vc.exe" -UseBasicParsing
+          Start-Process "$env:TEMP\vc.exe" -ArgumentList "/quiet","/norestart" -Wait
+          $vars = @{
+            "GALLIUM_DRIVER"              = "llvmpipe"
+            "LP_NUM_THREADS"              = "$env:NUMBER_OF_PROCESSORS"
+            "MESA_GL_VERSION_OVERRIDE"    = "4.5COMPAT"
+            "MESA_GLSL_VERSION_OVERRIDE"  = "450"
+            "MESA_GLTHREAD"               = "true"
+          }
+          foreach ($k in $vars.Keys) {
+            [Environment]::SetEnvironmentVariable($k, $vars[$k], "Machine")
+          }
+          $x64 = (Get-ChildItem $mesaDir -Directory -Recurse -Filter "x64" | Select-Object -First 1).FullName
+          $bat = @"
+          @echo off
+          if "%~1"=="" (echo Arrastra la carpeta de la app sobre este archivo & pause & exit /b)
+          copy /Y "$x64\opengl32.dll" "%~1\" >nul
+          copy /Y "$x64\libgallium_wgl.dll" "%~1\" >nul
+          copy /Y "$x64\libglapi.dll" "%~1\" >nul
+          echo Mesa3D activado en: %~1
+          pause
+          "@
+          Set-Content -Path "C:\Users\Public\Desktop\Activar-3D-en-app.bat" -Value $bat -Encoding ASCII
+          Write-Host "Mesa3D listo en $x64 (sin tocar System32)" -ForegroundColor Green
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          # Generar contraseña aleatoria robusta (20 caracteres)
+          $upper = (65..90) | ForEach-Object { [char]$_ }
+          $lower = (97..122) | ForEach-Object { [char]$_ }
+          $digits = (48..57) | ForEach-Object { [char]$_ }
+          $symbols = @(33,35,36,37,38,42,43,45,61,64,63) | ForEach-Object { [char]$_ }
+          
+          # Asegurar al menos uno de cada tipo
+          $password = @(
+            $upper | Get-Random
+            $upper | Get-Random
+            $lower | Get-Random
+            $lower | Get-Random
+            $digits | Get-Random
+            $digits | Get-Random
+            $symbols | Get-Random
+            $symbols | Get-Random
+          )
+          
+          # Completar hasta 20 caracteres aleatorios
+          $allChars = $upper + $lower + $digits + $symbols
+          while ($password.Count -lt 20) {
+            $password += $allChars | Get-Random
+          }
+          
+          # Mezclar
+          $password = -join ($password | Sort-Object { Get-Random })
+          
+          # MOSTRAR CONTRASEÑA COMPLETA (evitando filtros de GitHub)
+          Write-Host "=========================================="
+          Write-Host "CONTRASEÑA RDP GENERADA:"
+          Write-Host $password
+          Write-Host "=========================================="
+          
+          # También guardar en archivo por si acaso
+          $password | Out-File -FilePath "$env:USERPROFILE\Desktop\rdp_password.txt" -Encoding utf8
+          
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires -ErrorAction SilentlyContinue | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) { 
+            Write-Error "User creation failed"
+            exit 1 
+          }
+          
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i","`"$installer`"","/quiet","/norestart" -Wait
+          Remove-Item $installer -Force
+      - name: Connect Tailscale
+        shell: pwsh
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null; $i = 0
+          while (-not $tsIP -and $i -lt 15) {
+            Start-Sleep -Seconds 4
+            $tsIP = (& $ts ip -4 2>$null | Select-Object -First 1)
+            $i++
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Verify
+        shell: pwsh
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) { Write-Error "RDP 3389 no accesible"; exit 1 }
+          Write-Host "RDP    : OK"
+          Write-Host "Node   : $(node --version)"
+          Write-Host "NPM    : $(npm --version)"
+          Write-Host "Python : $(python --version)"
+          Write-Host "Git    : $(git --version)"
+          Write-Host "OpenCode: $(opencode --version)"
+          Write-Host "Mesa3D : $(Test-Path 'C:\mesa3d')"
+      - name: Keep Alive
+        shell: pwsh
+        run: |
+          Write-Host "========== RDP ACCESS =========="
+          Write-Host "IP:       $env:TAILSCALE_IP"
+          Write-Host "User:     RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "3D: Mesa llvmpipe (ejecuta 'Activar-3D-en-app.bat' del escritorio para cada app)"
+          Write-Host "================================"
+          while ($true) { Start-Sleep -Seconds 60 }
